@@ -4,9 +4,39 @@ import type { Pt, Shape, Sheet } from '@/logic/types'
 import type { ComputedShape } from '@/logic/pipeline'
 import type { Job } from '@/logic/job'
 import type { CutStep } from '@/logic/order'
-import { closestOnPolyline, boundsOf, mergeBounds } from '@/logic/geometry'
+import { boundsOf, round3 } from '@/logic/geometry'
 import type { SheetPlacement } from '@/logic/exporters'
 import { placePoint } from '@/logic/exporters'
+import {
+  beginPan,
+  contentBounds,
+  fitView,
+  focusView,
+  gridLines as computeGridLines,
+  magnifierLayout,
+  panTo,
+  toMm,
+  toPx,
+  zoomAt,
+  zoomBy as zoomViewBy,
+  WHEEL_ZOOM_FACTOR,
+  type ViewSize,
+  type ViewTransform,
+} from '@/canvas/viewport'
+import { hitTestContours, hitToleranceMm, manualBridgeAt } from '@/canvas/hitTest'
+import {
+  addPolygonPoint,
+  canFinishPolygon,
+  finishCircle,
+  finishPolygon as finishPolygonPoints,
+  finishRect,
+  startCircle,
+  startRect,
+  updateCircle,
+  updateRect,
+  type CircleDraft,
+  type RectDraft,
+} from '@/canvas/drawDraft'
 
 type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'rect' | 'circle' | 'polygon' | 'bridge' | 'pan'
@@ -56,53 +86,34 @@ const emit = defineEmits<{
 }>()
 
 const wrap = ref<HTMLDivElement | null>(null)
-const size = ref({ w: 800, h: 600 })
+const size = ref<ViewSize>({ w: 800, h: 600 })
 const zoom = ref(2.2)
 const panX = ref(0)
 const panY = ref(0)
 const dragging = ref(false)
 const dragStart = ref({ x: 0, y: 0 })
-const draftRect = ref<{ x: number; y: number; w: number; h: number } | null>(null)
-const draftCircle = ref<{ cx: number; cy: number; r: number } | null>(null)
+const draftRect = ref<RectDraft | null>(null)
+const draftCircle = ref<CircleDraft | null>(null)
 const polyDraft = ref<Pt[]>([])
 const hoverPt = ref<Pt | null>(null)
 let ro: ResizeObserver | null = null
 
-/** mm → 屏幕 px */
-const toPx = (p: Pt): Pt => ({ x: p.x * zoom.value + panX.value, y: p.y * zoom.value + panY.value })
-
-function contentBounds() {
-  const list: ReturnType<typeof boundsOf>[] = []
-  for (const s of props.shapes) {
-    if (s.contours.length === 0) continue
-    list.push(boundsOf(s.contours.flatMap((c) => c.points)))
-  }
-  if (props.sheet) list.push({ minX: 0, minY: 0, maxX: props.sheet.widthMm, maxY: props.sheet.heightMm })
-  if (list.length === 0) return { minX: 0, minY: 0, maxX: 100, maxY: 100 }
-  return mergeBounds(list)
+/** 当前视图变换（mm ↔ 屏幕 px 的换算统一走 viewport 模块） */
+const currentView = (): ViewTransform => ({ zoom: zoom.value, panX: panX.value, panY: panY.value })
+const applyView = (v: ViewTransform): void => {
+  zoom.value = v.zoom
+  panX.value = v.panX
+  panY.value = v.panY
 }
 
-const bounds = computed(() => contentBounds())
+const bounds = computed(() => contentBounds(props.shapes, props.sheet))
 
 function fit(): void {
-  const b = contentBounds()
-  const pad = 24
-  const w = Math.max(40, size.value.w - pad * 2)
-  const h = Math.max(40, size.value.h - pad * 2)
-  const bw = Math.max(1, b.maxX - b.minX)
-  const bh = Math.max(1, b.maxY - b.minY)
-  zoom.value = Math.min(w / bw, h / bh)
-  panX.value = pad + (w - bw * zoom.value) / 2 - b.minX * zoom.value
-  panY.value = pad + (h - bh * zoom.value) / 2 - b.minY * zoom.value
+  applyView(fitView(contentBounds(props.shapes, props.sheet), size.value))
 }
 
 function zoomBy(f: number): void {
-  const cx = size.value.w / 2
-  const cy = size.value.h / 2
-  const before = { x: (cx - panX.value) / zoom.value, y: (cy - panY.value) / zoom.value }
-  zoom.value = Math.max(0.05, Math.min(200, zoom.value * f))
-  panX.value = cx - before.x * zoom.value
-  panY.value = cy - before.y * zoom.value
+  applyView(zoomViewBy(currentView(), size.value, f))
 }
 
 function localPoint(e: PointerEvent | MouseEvent): Pt {
@@ -110,10 +121,6 @@ function localPoint(e: PointerEvent | MouseEvent): Pt {
   if (!el) return { x: 0, y: 0 }
   const r = el.getBoundingClientRect()
   return { x: e.clientX - r.left, y: e.clientY - r.top }
-}
-
-function toMm(p: Pt): Pt {
-  return { x: (p.x - panX.value) / zoom.value, y: (p.y - panY.value) / zoom.value }
 }
 
 onMounted(() => {
@@ -134,7 +141,7 @@ onUnmounted(() => {
 })
 
 function onKey(e: KeyboardEvent): void {
-  if (e.key === 'Enter' && polyDraft.value.length >= 3) finishPolygon()
+  if (e.key === 'Enter' && canFinishPolygon(polyDraft.value)) finishPolygon()
   if (e.key === 'Escape') {
     polyDraft.value = []
     draftRect.value = null
@@ -168,66 +175,57 @@ function capture(id: number): void {
 
 function onDown(e: PointerEvent): void {
   const px = localPoint(e)
-  const mm = toMm(px)
+  const mm = toMm(px, currentView())
   if (props.tool === 'pan' || e.button === 1) {
     dragging.value = true
-    dragStart.value = { x: px.x - panX.value, y: px.y - panY.value }
+    dragStart.value = beginPan(currentView(), px)
     capture(e.pointerId)
     return
   }
   if (props.tool === 'rect') {
     dragging.value = true
-    draftRect.value = { x: mm.x, y: mm.y, w: 0, h: 0 }
+    draftRect.value = startRect(mm)
     capture(e.pointerId)
     return
   }
   if (props.tool === 'circle') {
     dragging.value = true
-    draftCircle.value = { cx: mm.x, cy: mm.y, r: 0 }
+    draftCircle.value = startCircle(mm)
     capture(e.pointerId)
     return
   }
   if (props.tool === 'polygon') {
-    polyDraft.value.push({ x: round3(mm.x), y: round3(mm.y) })
+    polyDraft.value = addPolygonPoint(polyDraft.value, mm)
     return
   }
   if (props.tool === 'bridge') {
-    const hit = hitTest(mm)
-    if (hit) {
-      const c = closestOnPolyline(mm, hit.contour.points, hit.contour.closed)
-      emit('manualBridge', { contourId: hit.contour.id, atIndex: c.index })
-    }
+    const b = manualBridgeAt(props.shapes, mm, hitToleranceMm(zoom.value))
+    if (b) emit('manualBridge', b)
     return
   }
   // select
-  const hit = hitTest(mm)
+  const hit = hitTestContours(props.shapes, mm, hitToleranceMm(zoom.value))
   if (hit) emit('selectContour', hit.contour.id, hit.shape.id)
 }
 
 function onMove(e: PointerEvent): void {
   const px = localPoint(e)
-  const mm = toMm(px)
+  const mm = toMm(px, currentView())
   hoverPt.value = mm
   emit('cursor', { x: round3(mm.x), y: round3(mm.y) })
   if (!dragging.value) return
   if (props.tool === 'rect' && draftRect.value) {
-    const s = draftRect.value
-    draftRect.value = {
-      x: Math.min(s.x + s.w, mm.x),
-      y: Math.min(s.y + s.h, mm.y),
-      w: Math.abs(mm.x - (s.x + s.w)),
-      h: Math.abs(mm.y - (s.y + s.h)),
-    }
+    draftRect.value = updateRect(draftRect.value, mm)
     return
   }
   if (props.tool === 'circle' && draftCircle.value) {
-    const c = draftCircle.value
-    draftCircle.value = { cx: c.cx, cy: c.cy, r: Math.hypot(mm.x - c.cx, mm.y - c.cy) }
+    draftCircle.value = updateCircle(draftCircle.value, mm)
     return
   }
   if (props.tool === 'pan') {
-    panX.value = px.x - dragStart.value.x
-    panY.value = px.y - dragStart.value.y
+    const p = panTo(dragStart.value, px)
+    panX.value = p.panX
+    panY.value = p.panY
   }
 }
 
@@ -235,48 +233,28 @@ function onUp(): void {
   if (!dragging.value) return
   dragging.value = false
   if (props.tool === 'rect' && draftRect.value) {
-    const r = draftRect.value
+    const r = finishRect(draftRect.value)
     draftRect.value = null
-    if (r.w > 0.5 && r.h > 0.5) emit('createRect', { x: round3(r.x), y: round3(r.y), w: round3(r.w), h: round3(r.h) })
+    if (r) emit('createRect', r)
     return
   }
   if (props.tool === 'circle' && draftCircle.value) {
-    const c = draftCircle.value
+    const c = finishCircle(draftCircle.value)
     draftCircle.value = null
-    if (c.r > 0.5) emit('createCircle', { cx: round3(c.cx), cy: round3(c.cy), r: round3(c.r) })
+    if (c) emit('createCircle', c)
   }
 }
 
 function onWheel(e: WheelEvent): void {
   e.preventDefault()
   const px = localPoint(e)
-  const before = toMm(px)
-  zoomBy(e.deltaY < 0 ? 1.12 : 1 / 1.12)
-  const after = toPx(before)
-  panX.value += px.x - after.x
-  panY.value += px.y - after.y
+  applyView(zoomAt(currentView(), size.value, px, e.deltaY < 0 ? WHEEL_ZOOM_FACTOR : 1 / WHEEL_ZOOM_FACTOR))
 }
 
 function finishPolygon(): void {
-  if (polyDraft.value.length >= 3) emit('createPolygon', polyDraft.value.slice())
+  const pts = finishPolygonPoints(polyDraft.value)
+  if (pts) emit('createPolygon', pts)
   polyDraft.value = []
-}
-
-function hitTest(mm: Pt): { shape: Shape; contour: Shape['contours'][number] } | null {
-  const tol = 6 / zoom.value
-  let best: { shape: Shape; contour: Shape['contours'][number]; d: number } | null = null
-  for (const s of props.shapes) {
-    for (const c of s.contours) {
-      if (c.points.length < 2) continue
-      const d = closestOnPolyline(mm, c.points, c.closed).distance
-      if (d <= tol && (!best || d < best.d)) best = { shape: s, contour: c, d }
-    }
-  }
-  return best ? { shape: best.shape, contour: best.contour } : null
-}
-
-function round3(v: number): number {
-  return Math.round(v * 1000) / 1000
 }
 
 // ---------------- 渲染数据 ----------------
@@ -393,29 +371,22 @@ const bridges = computed(() => {
   return out
 })
 
-const MAG = 8
-
 /** 每个缺口对应的放大镜（屏幕坐标 + 局部几何屏幕坐标） */
 const magnifiers = computed(() => {
   if (!props.magnify || props.mode !== 'bridge') return []
-  const limit = 8
-  return bridges.value.slice(0, limit).map((b, i) => {
-    const anchor = toPx(pl({ x: b.x, y: b.y }))
-    const center = { x: 62 + (i % 4) * 128, y: size.value.h - 74 - Math.floor(i / 4) * 128 }
-    const local = b.local.map((p) => {
-      const s = toPx(pl(p))
-      return { x: center.x + (s.x - anchor.x) * MAG, y: center.y + (s.y - anchor.y) * MAG }
-    })
-    const endPx = toPx(pl(b.end))
-    const gapA = { x: center.x, y: center.y }
-    const gapB = { x: center.x + (endPx.x - anchor.x) * MAG, y: center.y + (endPx.y - anchor.y) * MAG }
-    return { key: `${b.contourId}-${i}`, anchor, center, local, gapA, gapB, widthMm: b.widthMm, clipId: `magclip-${i}` }
-  })
+  const items = bridges.value.map((b) => ({
+    at: pl({ x: b.x, y: b.y }),
+    end: pl(b.end),
+    local: b.local.map(pl),
+    widthMm: b.widthMm,
+    contourId: b.contourId,
+  }))
+  return magnifierLayout(items, (p) => toPx(p, currentView()), size.value)
 })
 
 const simPts = computed(() => {
   if (!props.simPath || props.simPath.length === 0) return []
-  return props.simPath.map((p) => toPx(pl(p)))
+  return props.simPath.map((p) => toPx(pl(p), currentView()))
 })
 
 const simHead = computed(() => {
@@ -431,25 +402,7 @@ const donePath = computed(() => {
 
 const gridLines = computed(() => {
   if (!props.showGrid) return { v: [] as number[], h: [] as number[], label: [] as Array<{ x: number; y: number; t: string }> }
-  const b = bounds.value
-  let step = 10
-  const span = Math.max(b.maxX - b.minX, b.maxY - b.minY)
-  if (span / step > 40) step = 50
-  if (span / step < 6) step = 5
-  const v: number[] = []
-  const h: number[] = []
-  const label: Array<{ x: number; y: number; t: string }> = []
-  const x0 = Math.floor(b.minX / step) * step
-  const y0 = Math.floor(b.minY / step) * step
-  for (let x = x0; x <= b.maxX + step; x += step) {
-    v.push(x)
-    label.push({ x, y: b.minY, t: String(Math.round(x)) })
-  }
-  for (let y = y0; y <= b.maxY + step; y += step) {
-    h.push(y)
-    label.push({ x: b.minX, y, t: String(Math.round(y)) })
-  }
-  return { v, h, label }
+  return computeGridLines(bounds.value)
 })
 
 defineExpose({ fit, zoomBy, zoom, focusContour })
@@ -458,17 +411,7 @@ function focusContour(id: string): void {
   for (const s of props.shapes) {
     for (const c of s.contours) {
       if (c.id !== id || c.points.length === 0) continue
-      const b = boundsOf(c.points)
-      const pad = 70
-      const w = Math.max(40, size.value.w - pad * 2)
-      const h = Math.max(40, size.value.h - pad * 2)
-      const bw = Math.max(0.5, b.maxX - b.minX)
-      const bh = Math.max(0.5, b.maxY - b.minY)
-      zoom.value = Math.min(40, Math.min(w / bw, h / bh))
-      const cx = (b.minX + b.maxX) / 2
-      const cy = (b.minY + b.maxY) / 2
-      panX.value = size.value.w / 2 - cx * zoom.value
-      panY.value = size.value.h / 2 - cy * zoom.value
+      applyView(focusView(boundsOf(c.points), size.value))
       return
     }
   }
