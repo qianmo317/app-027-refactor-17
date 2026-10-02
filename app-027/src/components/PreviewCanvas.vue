@@ -4,11 +4,47 @@ import type { Pt, Shape, Sheet } from '@/logic/types'
 import type { ComputedShape } from '@/logic/pipeline'
 import type { Job } from '@/logic/job'
 import type { CutStep } from '@/logic/order'
-import { closestOnPolyline, boundsOf, mergeBounds } from '@/logic/geometry'
+import { round3 } from '@/logic/geometry'
 import type { SheetPlacement } from '@/logic/exporters'
-import { placePoint } from '@/logic/exporters'
+import {
+  INITIAL_CAMERA,
+  contentBounds,
+  fitView,
+  focusBounds,
+  toMm as mmOfPx,
+  zoomAtPoint,
+  zoomToAtCenter,
+  type ViewSize,
+} from '@/canvas/camera'
+import { hitContour, pickBridgeAnchor } from '@/canvas/hitTest'
+import {
+  addPolygonPoint,
+  beginCircle,
+  beginRect,
+  cancelDraft,
+  emptyDraft,
+  finishCircle,
+  finishPolygon as commitPolygon,
+  finishRect,
+  updateCircle,
+  updateRect,
+  type DraftState,
+} from '@/canvas/draft'
+import {
+  buildBridges,
+  buildCutPaths,
+  buildGridLines,
+  buildMagnifiers,
+  buildNumbers,
+  buildOutlineContours,
+  buildSimulation,
+  buildTravels,
+  boundsOfContour,
+  collectCutSteps,
+  makeProjector,
+  type Mode,
+} from '@/canvas/render'
 
-type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'rect' | 'circle' | 'polygon' | 'bridge' | 'pan'
 
 const props = withDefaults(
@@ -56,53 +92,40 @@ const emit = defineEmits<{
 }>()
 
 const wrap = ref<HTMLDivElement | null>(null)
-const size = ref({ w: 800, h: 600 })
-const zoom = ref(2.2)
-const panX = ref(0)
-const panY = ref(0)
+const size = ref<ViewSize>({ w: 800, h: 600 })
+// 相机（mm⇄px 换算、缩放与平移）的唯一真源在 @/canvas/camera
+const zoom = ref(INITIAL_CAMERA.zoom)
+const panX = ref(INITIAL_CAMERA.panX)
+const panY = ref(INITIAL_CAMERA.panY)
 const dragging = ref(false)
 const dragStart = ref({ x: 0, y: 0 })
-const draftRect = ref<{ x: number; y: number; w: number; h: number } | null>(null)
-const draftCircle = ref<{ cx: number; cy: number; r: number } | null>(null)
-const polyDraft = ref<Pt[]>([])
+const draft = ref<DraftState>(emptyDraft())
 const hoverPt = ref<Pt | null>(null)
 let ro: ResizeObserver | null = null
 
-/** mm → 屏幕 px */
-const toPx = (p: Pt): Pt => ({ x: p.x * zoom.value + panX.value, y: p.y * zoom.value + panY.value })
-
-function contentBounds() {
-  const list: ReturnType<typeof boundsOf>[] = []
-  for (const s of props.shapes) {
-    if (s.contours.length === 0) continue
-    list.push(boundsOf(s.contours.flatMap((c) => c.points)))
-  }
-  if (props.sheet) list.push({ minX: 0, minY: 0, maxX: props.sheet.widthMm, maxY: props.sheet.heightMm })
-  if (list.length === 0) return { minX: 0, minY: 0, maxX: 100, maxY: 100 }
-  return mergeBounds(list)
-}
-
-const bounds = computed(() => contentBounds())
+const bounds = computed(() => contentBounds(props.shapes, props.sheet))
 
 function fit(): void {
-  const b = contentBounds()
-  const pad = 24
-  const w = Math.max(40, size.value.w - pad * 2)
-  const h = Math.max(40, size.value.h - pad * 2)
-  const bw = Math.max(1, b.maxX - b.minX)
-  const bh = Math.max(1, b.maxY - b.minY)
-  zoom.value = Math.min(w / bw, h / bh)
-  panX.value = pad + (w - bw * zoom.value) / 2 - b.minX * zoom.value
-  panY.value = pad + (h - bh * zoom.value) / 2 - b.minY * zoom.value
+  const c = cam()
+  fitView(c, bounds.value, size.value)
+  syncCam(c)
 }
 
+/** 以视口中心为不动点缩放（工具栏按钮 / 对外暴露） */
 function zoomBy(f: number): void {
-  const cx = size.value.w / 2
-  const cy = size.value.h / 2
-  const before = { x: (cx - panX.value) / zoom.value, y: (cy - panY.value) / zoom.value }
-  zoom.value = Math.max(0.05, Math.min(200, zoom.value * f))
-  panX.value = cx - before.x * zoom.value
-  panY.value = cy - before.y * zoom.value
+  const c = cam()
+  zoomToAtCenter(c, f, size.value)
+  syncCam(c)
+}
+
+/** 可变相机视图：模块函数原地更新后，再同步回各个 ref */
+function cam() {
+  return { zoom: zoom.value, panX: panX.value, panY: panY.value }
+}
+function syncCam(c: { zoom: number; panX: number; panY: number }): void {
+  zoom.value = c.zoom
+  panX.value = c.panX
+  panY.value = c.panY
 }
 
 function localPoint(e: PointerEvent | MouseEvent): Pt {
@@ -113,7 +136,7 @@ function localPoint(e: PointerEvent | MouseEvent): Pt {
 }
 
 function toMm(p: Pt): Pt {
-  return { x: (p.x - panX.value) / zoom.value, y: (p.y - panY.value) / zoom.value }
+  return mmOfPx(p, cam())
 }
 
 onMounted(() => {
@@ -134,12 +157,8 @@ onUnmounted(() => {
 })
 
 function onKey(e: KeyboardEvent): void {
-  if (e.key === 'Enter' && polyDraft.value.length >= 3) finishPolygon()
-  if (e.key === 'Escape') {
-    polyDraft.value = []
-    draftRect.value = null
-    draftCircle.value = null
-  }
+  if (e.key === 'Enter' && draft.value.polygon.length >= 3) finishPolygon()
+  if (e.key === 'Escape') draft.value = cancelDraft()
 }
 
 watch(
@@ -152,9 +171,7 @@ watch(
 watch(
   () => props.tool,
   () => {
-    polyDraft.value = []
-    draftRect.value = null
-    draftCircle.value = null
+    draft.value = cancelDraft()
   },
 )
 
@@ -177,30 +194,27 @@ function onDown(e: PointerEvent): void {
   }
   if (props.tool === 'rect') {
     dragging.value = true
-    draftRect.value = { x: mm.x, y: mm.y, w: 0, h: 0 }
+    draft.value = beginRect(draft.value, mm)
     capture(e.pointerId)
     return
   }
   if (props.tool === 'circle') {
     dragging.value = true
-    draftCircle.value = { cx: mm.x, cy: mm.y, r: 0 }
+    draft.value = beginCircle(draft.value, mm)
     capture(e.pointerId)
     return
   }
   if (props.tool === 'polygon') {
-    polyDraft.value.push({ x: round3(mm.x), y: round3(mm.y) })
+    draft.value = addPolygonPoint(draft.value, mm)
     return
   }
   if (props.tool === 'bridge') {
-    const hit = hitTest(mm)
-    if (hit) {
-      const c = closestOnPolyline(mm, hit.contour.points, hit.contour.closed)
-      emit('manualBridge', { contourId: hit.contour.id, atIndex: c.index })
-    }
+    const hit = pickBridgeAnchor(mm, props.shapes, zoom.value)
+    if (hit) emit('manualBridge', hit)
     return
   }
   // select
-  const hit = hitTest(mm)
+  const hit = hitContour(mm, props.shapes, zoom.value)
   if (hit) emit('selectContour', hit.contour.id, hit.shape.id)
 }
 
@@ -210,19 +224,12 @@ function onMove(e: PointerEvent): void {
   hoverPt.value = mm
   emit('cursor', { x: round3(mm.x), y: round3(mm.y) })
   if (!dragging.value) return
-  if (props.tool === 'rect' && draftRect.value) {
-    const s = draftRect.value
-    draftRect.value = {
-      x: Math.min(s.x + s.w, mm.x),
-      y: Math.min(s.y + s.h, mm.y),
-      w: Math.abs(mm.x - (s.x + s.w)),
-      h: Math.abs(mm.y - (s.y + s.h)),
-    }
+  if (props.tool === 'rect' && draft.value.rect) {
+    draft.value = updateRect(draft.value, mm)
     return
   }
-  if (props.tool === 'circle' && draftCircle.value) {
-    const c = draftCircle.value
-    draftCircle.value = { cx: c.cx, cy: c.cy, r: Math.hypot(mm.x - c.cx, mm.y - c.cy) }
+  if (props.tool === 'circle' && draft.value.circle) {
+    draft.value = updateCircle(draft.value, mm)
     return
   }
   if (props.tool === 'pan') {
@@ -234,244 +241,62 @@ function onMove(e: PointerEvent): void {
 function onUp(): void {
   if (!dragging.value) return
   dragging.value = false
-  if (props.tool === 'rect' && draftRect.value) {
-    const r = draftRect.value
-    draftRect.value = null
-    if (r.w > 0.5 && r.h > 0.5) emit('createRect', { x: round3(r.x), y: round3(r.y), w: round3(r.w), h: round3(r.h) })
+  if (props.tool === 'rect' && draft.value.rect) {
+    const { next, commit } = finishRect(draft.value)
+    draft.value = next
+    if (commit) emit('createRect', commit)
     return
   }
-  if (props.tool === 'circle' && draftCircle.value) {
-    const c = draftCircle.value
-    draftCircle.value = null
-    if (c.r > 0.5) emit('createCircle', { cx: round3(c.cx), cy: round3(c.cy), r: round3(c.r) })
+  if (props.tool === 'circle' && draft.value.circle) {
+    const { next, commit } = finishCircle(draft.value)
+    draft.value = next
+    if (commit) emit('createCircle', commit)
   }
 }
 
 function onWheel(e: WheelEvent): void {
   e.preventDefault()
   const px = localPoint(e)
-  const before = toMm(px)
-  zoomBy(e.deltaY < 0 ? 1.12 : 1 / 1.12)
-  const after = toPx(before)
-  panX.value += px.x - after.x
-  panY.value += px.y - after.y
+  const c = cam()
+  zoomAtPoint(c, e.deltaY < 0 ? 1.12 : 1 / 1.12, px)
+  syncCam(c)
 }
 
 function finishPolygon(): void {
-  if (polyDraft.value.length >= 3) emit('createPolygon', polyDraft.value.slice())
-  polyDraft.value = []
+  const { next, commit } = commitPolygon(draft.value)
+  draft.value = next
+  if (commit) emit('createPolygon', commit)
 }
 
-function hitTest(mm: Pt): { shape: Shape; contour: Shape['contours'][number] } | null {
-  const tol = 6 / zoom.value
-  let best: { shape: Shape; contour: Shape['contours'][number]; d: number } | null = null
-  for (const s of props.shapes) {
-    for (const c of s.contours) {
-      if (c.points.length < 2) continue
-      const d = closestOnPolyline(mm, c.points, c.closed).distance
-      if (d <= tol && (!best || d < best.d)) best = { shape: s, contour: c, d }
-    }
-  }
-  return best ? { shape: best.shape, contour: best.contour } : null
-}
+// ---------------- 渲染数据（纯计算，见 @/canvas/render） ----------------
 
-function round3(v: number): number {
-  return Math.round(v * 1000) / 1000
-}
+const outlineContours = computed(() => buildOutlineContours(props.shapes, props.mode, props.selectedContourId))
 
-// ---------------- 渲染数据 ----------------
+const projector = computed(() => makeProjector(props.placement))
+const pl = (p: Pt): Pt => projector.value(p)
 
-type DrawContour = {
-  id: string
-  shapeId: string
-  d: string
-  contour: Shape['contours'][number]
-  color: string
-  dash: string
-  width: number
-}
+const cutSteps = computed<CutStep[]>(() => collectCutSteps(props.shapes, props.computed, props.job))
+const cutPaths = computed(() => buildCutPaths(cutSteps.value, pl, props.selectedContourId))
+const travels = computed(() => buildTravels(cutSteps.value, pl))
+const numbers = computed(() => buildNumbers(props.showNumbers, cutSteps.value, pl))
+const bridges = computed(() => buildBridges(props.shapes, props.computed))
+const magnifiers = computed(() => buildMagnifiers(props.magnify, props.mode, bridges.value, pl, cam(), size.value))
 
-const WARNING_COLOR: Record<string, string> = {
-  not_closed: '#ffc857',
-  self_intersect: '#ff6b6b',
-  duplicate: '#b48cff',
-  offset_failed: '#ff6b6b',
-  offset_clipped: '#5aa9ff',
-  bridge_degraded: '#ff8f3c',
-}
+const simulation = computed(() => buildSimulation(props.simPath, props.simIndex, pl, cam()))
+const simPts = computed(() => simulation.value.pts)
+const simHead = computed(() => simulation.value.head)
+const donePath = computed(() => simulation.value.donePath)
 
-function pointsToD(pts: Pt[], closed: boolean): string {
-  if (pts.length === 0) return ''
-  let d = `M${pts[0].x.toFixed(3)} ${pts[0].y.toFixed(3)}`
-  for (let i = 1; i < pts.length; i++) d += `L${pts[i].x.toFixed(3)} ${pts[i].y.toFixed(3)}`
-  if (closed) d += 'Z'
-  return d
-}
-
-const outlineContours = computed<DrawContour[]>(() => {
-  const out: DrawContour[] = []
-  for (const s of props.shapes) {
-    for (const c of s.contours) {
-      const bad = c.warnings.find((w) => w === 'self_intersect' || w === 'not_closed' || w === 'duplicate')
-      out.push({
-        id: c.id,
-        shapeId: s.id,
-        d: pointsToD(c.points, c.closed),
-        contour: c,
-        color: bad ? WARNING_COLOR[bad] : props.mode === 'bridge' ? '#4a5768' : '#cfd9e4',
-        dash: bad === 'duplicate' ? '5 4' : bad === 'not_closed' ? '7 4' : '',
-        width: c.id === props.selectedContourId ? 2.4 : 1.2,
-      })
-    }
-  }
-  return out
-})
-
-const pl = (p: Pt): Pt => (props.placement ? placePoint(p, props.placement) : p)
-
-const cutSteps = computed<CutStep[]>(() => {
-  if (props.job) return props.job.steps
-  const out: CutStep[] = []
-  for (const s of props.shapes) {
-    const c = props.computed.get(s.id)
-    if (!c) continue
-    for (const st of c.order.steps) out.push(st)
-  }
-  return out
-})
-
-const cutPaths = computed(() =>
-  cutSteps.value.map((st, i) => ({
-    i,
-    d: pointsToD(st.points.map(pl), st.closed),
-    selected: st.contourId === props.selectedContourId,
-  })),
-)
-
-const travels = computed(() => {
-  const steps = cutSteps.value
-  const out: Array<{ x1: number; y1: number; x2: number; y2: number }> = []
-  for (let i = 1; i < steps.length; i++) {
-    const a = pl(steps[i - 1].endPt)
-    const b = pl(steps[i].startPt)
-    out.push({ x1: a.x, y1: a.y, x2: b.x, y2: b.y })
-  }
-  return out
-})
-
-const numbers = computed(() => {
-  if (!props.showNumbers) return []
-  const steps = cutSteps.value
-  const max = 120
-  return steps.slice(0, max).map((st, i) => {
-    const p = pl(st.startPt)
-    return { i: i + 1, x: p.x, y: p.y, more: steps.length > max && i === max - 1 }
-  })
-})
-
-/** 连刀点缺口（来自派生结果，用于放大视图） */
-const bridges = computed(() => {
-  const out: Array<{ x: number; y: number; end: Pt; widthMm: number; local: Pt[]; contourId: string }> = []
-  for (const s of props.shapes) {
-    const comp = props.computed.get(s.id)
-    if (!comp) continue
-    for (const c of s.contours) {
-      const entry = comp.byId.get(c.id)
-      if (!entry) continue
-      for (const a of entry.anchors) {
-        out.push({
-          x: a.at.x,
-          y: a.at.y,
-          end: a.end,
-          widthMm: a.widthMm,
-          local: a.local,
-          contourId: c.id,
-        })
-      }
-    }
-  }
-  return out
-})
-
-const MAG = 8
-
-/** 每个缺口对应的放大镜（屏幕坐标 + 局部几何屏幕坐标） */
-const magnifiers = computed(() => {
-  if (!props.magnify || props.mode !== 'bridge') return []
-  const limit = 8
-  return bridges.value.slice(0, limit).map((b, i) => {
-    const anchor = toPx(pl({ x: b.x, y: b.y }))
-    const center = { x: 62 + (i % 4) * 128, y: size.value.h - 74 - Math.floor(i / 4) * 128 }
-    const local = b.local.map((p) => {
-      const s = toPx(pl(p))
-      return { x: center.x + (s.x - anchor.x) * MAG, y: center.y + (s.y - anchor.y) * MAG }
-    })
-    const endPx = toPx(pl(b.end))
-    const gapA = { x: center.x, y: center.y }
-    const gapB = { x: center.x + (endPx.x - anchor.x) * MAG, y: center.y + (endPx.y - anchor.y) * MAG }
-    return { key: `${b.contourId}-${i}`, anchor, center, local, gapA, gapB, widthMm: b.widthMm, clipId: `magclip-${i}` }
-  })
-})
-
-const simPts = computed(() => {
-  if (!props.simPath || props.simPath.length === 0) return []
-  return props.simPath.map((p) => toPx(pl(p)))
-})
-
-const simHead = computed(() => {
-  if (simPts.value.length === 0 || props.simIndex < 0) return null
-  return simPts.value[Math.min(props.simIndex, simPts.value.length - 1)]
-})
-
-const donePath = computed(() => {
-  if (simPts.value.length === 0 || props.simIndex < 0) return ''
-  const cut = simPts.value.slice(0, Math.max(1, props.simIndex))
-  return `M${cut.map((p) => `${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join('L')}`
-})
-
-const gridLines = computed(() => {
-  if (!props.showGrid) return { v: [] as number[], h: [] as number[], label: [] as Array<{ x: number; y: number; t: string }> }
-  const b = bounds.value
-  let step = 10
-  const span = Math.max(b.maxX - b.minX, b.maxY - b.minY)
-  if (span / step > 40) step = 50
-  if (span / step < 6) step = 5
-  const v: number[] = []
-  const h: number[] = []
-  const label: Array<{ x: number; y: number; t: string }> = []
-  const x0 = Math.floor(b.minX / step) * step
-  const y0 = Math.floor(b.minY / step) * step
-  for (let x = x0; x <= b.maxX + step; x += step) {
-    v.push(x)
-    label.push({ x, y: b.minY, t: String(Math.round(x)) })
-  }
-  for (let y = y0; y <= b.maxY + step; y += step) {
-    h.push(y)
-    label.push({ x: b.minX, y, t: String(Math.round(y)) })
-  }
-  return { v, h, label }
-})
+const gridLines = computed(() => buildGridLines(props.showGrid, bounds.value))
 
 defineExpose({ fit, zoomBy, zoom, focusContour })
 
 function focusContour(id: string): void {
-  for (const s of props.shapes) {
-    for (const c of s.contours) {
-      if (c.id !== id || c.points.length === 0) continue
-      const b = boundsOf(c.points)
-      const pad = 70
-      const w = Math.max(40, size.value.w - pad * 2)
-      const h = Math.max(40, size.value.h - pad * 2)
-      const bw = Math.max(0.5, b.maxX - b.minX)
-      const bh = Math.max(0.5, b.maxY - b.minY)
-      zoom.value = Math.min(40, Math.min(w / bw, h / bh))
-      const cx = (b.minX + b.maxX) / 2
-      const cy = (b.minY + b.maxY) / 2
-      panX.value = size.value.w / 2 - cx * zoom.value
-      panY.value = size.value.h / 2 - cy * zoom.value
-      return
-    }
-  }
+  const b = boundsOfContour(props.shapes, id)
+  if (!b) return
+  const c = cam()
+  focusBounds(c, b, size.value)
+  syncCam(c)
 }
 </script>
 
@@ -584,15 +409,15 @@ function focusContour(id: string): void {
         </g>
 
         <!-- 绘制中的草稿 -->
-        <g v-if="draftRect" fill="none" stroke="#5aa9ff" stroke-width="1.6" vector-effect="non-scaling-stroke">
-          <rect :x="draftRect.x" :y="draftRect.y" :width="draftRect.w" :height="draftRect.h" />
+        <g v-if="draft.rect" fill="none" stroke="#5aa9ff" stroke-width="1.6" vector-effect="non-scaling-stroke">
+          <rect :x="draft.rect.x" :y="draft.rect.y" :width="draft.rect.w" :height="draft.rect.h" />
         </g>
-        <g v-if="draftCircle" fill="none" stroke="#5aa9ff" stroke-width="1.6" vector-effect="non-scaling-stroke">
-          <circle :cx="draftCircle.cx" :cy="draftCircle.cy" :r="draftCircle.r" />
+        <g v-if="draft.circle" fill="none" stroke="#5aa9ff" stroke-width="1.6" vector-effect="non-scaling-stroke">
+          <circle :cx="draft.circle.cx" :cy="draft.circle.cy" :r="draft.circle.r" />
         </g>
-        <g v-if="polyDraft.length > 0" fill="none" stroke="#5aa9ff" stroke-width="1.6" vector-effect="non-scaling-stroke">
-          <polyline :points="[...polyDraft, hoverPt].filter(Boolean).map((p) => `${p!.x},${p!.y}`).join(' ')" />
-          <circle v-for="(p, i) in polyDraft" :key="`pd${i}`" :cx="p.x" :cy="p.y" :r="1.6 / zoom" fill="#5aa9ff" />
+        <g v-if="draft.polygon.length > 0" fill="none" stroke="#5aa9ff" stroke-width="1.6" vector-effect="non-scaling-stroke">
+          <polyline :points="[...draft.polygon, hoverPt].filter(Boolean).map((p) => `${p!.x},${p!.y}`).join(' ')" />
+          <circle v-for="(p, i) in draft.polygon" :key="`pd${i}`" :cx="p.x" :cy="p.y" :r="1.6 / zoom" fill="#5aa9ff" />
         </g>
       </g>
 
@@ -633,8 +458,8 @@ function focusContour(id: string): void {
       <span class="zoom-label mono">{{ (zoom * 100).toFixed(0) }}%</span>
     </div>
 
-    <div v-if="tool === 'polygon' && polyDraft.length > 0" class="canvas-hint no-print">
-      已放置 {{ polyDraft.length }} 个点｜回车或双击完成
+    <div v-if="tool === 'polygon' && draft.polygon.length > 0" class="canvas-hint no-print">
+      已放置 {{ draft.polygon.length }} 个点｜回车或双击完成
       <button class="tiny" @click="finishPolygon">完成</button>
     </div>
 

@@ -19,6 +19,7 @@ npm install
 npm run dev          # http://127.0.0.1:5173
 npm run build        # 类型检查 + 生产构建
 npm run preview      # 预览构建产物
+npm test             # vitest 单测（canvas 纯逻辑 + 应用自检端到端）
 ```
 
 ## Docker 构建
@@ -63,7 +64,13 @@ docker compose down
     │   ├── pipeline.ts      # 单形状全流程编排 + 几何签名缓存
     │   ├── selftest.ts      # 验收自检（第 10 节全部用例）
     │   └── store.ts         # 项目/材料状态与持久化
-    ├── components/PreviewCanvas.vue   # 预览画布（三种模式、放大镜、仿真、绘图交互）
+    ├── canvas/              # 预览画布拆出的纯逻辑（可脱离 DOM 单测）
+    │   ├── camera.ts        # mm⇄px 换算（唯一真源）、适应窗口、滚轮/中心缩放、聚焦、缩放范围
+    │   ├── hitTest.ts       # 点选命中（6px 容差）与手工连刀点最近段
+    │   ├── draft.ts         # 矩形/圆形/多边形草稿的状态推进（提交阈值 0.5mm）
+    │   ├── render.ts        # 三种模式的渲染数据（轮廓/刀路/跳刀/编号/放大镜×8/网格/仿真）
+    │   └── __tests__/       # 上述模块单测 + 应用自检端到端
+    ├── components/PreviewCanvas.vue   # 预览画布薄壳：持有状态、画结果、转发事件
     └── views/               # Home / Design / Layout / Export / Materials / Help
 ```
 
